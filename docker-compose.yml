@@ -1,0 +1,30 @@
+services:
+
+  clientes-db:
+    image: postgres:18
+    container_name: clientes-db
+    environment:
+      POSTGRES_DB: tienda_clientes
+      POSTGRES_USER: clientes_app
+      POSTGRES_PASSWORD: clientes123
+    volumes:
+      - clientes_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clientes_app -d tienda_clientes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clientes-service:
+    build: .
+    container_name: clientes-service
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://clientes_app:clientes123@clientes-db:5432/tienda_clientes
+    depends_on:
+      clientes-db:
+        condition: service_healthy
+
+volumes:
+  clientes_data:
