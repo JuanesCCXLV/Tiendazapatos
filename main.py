@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+import httpx 
 
 from database import engine, Base, get_db
 from models import Cliente
@@ -67,3 +68,46 @@ def obtener_clientes(
     clientes = db.query(Cliente).all()
 
     return clientes
+@app.get("/clientes/{cliente_id}/zapato/{id_zapato}")
+def obtener_cliente_y_zapato(
+    cliente_id: int,
+    id_zapato: int,
+    db: Session = Depends(get_db)
+):
+    cliente = db.query(Cliente).filter(
+        Cliente.id == cliente_id
+    ).first()
+
+    if cliente is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cliente no encontrado"
+        )
+
+    try:
+        respuesta = httpx.get(
+            f"http://zapatos-service:8002/zapatos/{id_zapato}",
+            timeout=5.0
+        )
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo conectar con el servicio de zapatos"
+        )
+
+    if respuesta.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail="Zapato no encontrado"
+        )
+
+    if respuesta.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail="El servicio de zapatos respondió con un error"
+        )
+
+    return {
+        "cliente": cliente,
+        "zapato": respuesta.json()
+    }
