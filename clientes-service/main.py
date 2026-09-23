@@ -68,6 +68,7 @@ def obtener_clientes(
     clientes = db.query(Cliente).all()
 
     return clientes
+    
 @app.get("/clientes/{cliente_id}/zapato/{id_zapato}")
 def obtener_cliente_y_zapato(
     cliente_id: int,

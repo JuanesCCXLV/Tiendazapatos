@@ -16,7 +16,7 @@ services:
       retries: 10
 
   clientes-service:
-    build: .
+    build: ./clientes-service
     container_name: clientes-service
     ports:
       - "8001:8001"
@@ -42,9 +42,7 @@ services:
       retries: 10
 
   zapatos-service:
-    build:
-      context: .
-      dockerfile: zapatos-service/Dockerfile
+    build: ./zapatos-service
     container_name: zapatos-service
     ports:
       - "8002:8002"
