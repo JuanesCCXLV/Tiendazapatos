@@ -26,5 +26,34 @@ services:
       clientes-db:
         condition: service_healthy
 
+  zapatos-db:
+    image: postgres:18
+    container_name: zapatos-db
+    environment:
+      POSTGRES_DB: tienda_zapatos
+      POSTGRES_USER: zapatos_app
+      POSTGRES_PASSWORD: zapatos123
+    volumes:
+      - zapatos_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zapatos_app -d tienda_zapatos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  zapatos-service:
+    build:
+      context: .
+      dockerfile: zapatos-service/Dockerfile
+    container_name: zapatos-service
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://zapatos_app:zapatos123@zapatos-db:5432/tienda_zapatos
+    depends_on:
+      zapatos-db:
+        condition: service_healthy
+
 volumes:
   clientes_data:
+  zapatos_data:
