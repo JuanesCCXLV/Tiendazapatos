@@ -16,7 +16,7 @@ services:
       retries: 10
 
   clientes-service:
-    build: .
+    build: ./clientes-service
     container_name: clientes-service
     ports:
       - "8001:8001"
@@ -42,9 +42,7 @@ services:
       retries: 10
 
   zapatos-service:
-    build:
-      context: .
-      dockerfile: zapatos-service/Dockerfile
+    build: ./zapatos-service
     container_name: zapatos-service
     ports:
       - "8002:8002"
@@ -54,6 +52,33 @@ services:
       zapatos-db:
         condition: service_healthy
 
+  ventas-db:
+    image: mongo:6
+    container_name: ventas-db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ventas_app
+      MONGO_INITDB_ROOT_PASSWORD: ventas123
+      MONGO_INITDB_DATABASE: tienda_ventas
+    volumes:
+      - ventas_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ventas-service:
+    build: ./ventas-service
+    container_name: ventas-service
+    ports:
+      - "8003:8003"
+    environment:
+      MONGO_URL: mongodb://ventas_app:ventas123@ventas-db:27017/tienda_ventas?authSource=admin
+    depends_on:
+      ventas-db:
+        condition: service_healthy
+
 volumes:
   clientes_data:
   zapatos_data:
+  ventas_data:
