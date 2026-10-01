@@ -3,3 +3,5 @@ uvicorn
 pymongo
 pydantic
 httpx
+pika==1.3.2
+

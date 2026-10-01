@@ -1,275 +1,144 @@
-# Diagramación de la arquitectura
+# Diagramación de la arquitectura - Patrón SAGA (Coreografía)
 
-Esta documentación representa la arquitectura actual del repositorio **Tiendazapatos** a partir de los servicios y del `docker-compose.yml`.
-
-## 1. Arquitectura general
-
-El proyecto utiliza una arquitectura de **microservicios** con el patrón **Database per Service**. Cada microservicio tiene su propia base de datos y no comparte directamente las tablas/colecciones con los demás.
-
-```mermaid
-flowchart TB
-    C[Cliente / Postman / Frontend]
-
-    subgraph APP["Tienda de Zapatos - Docker Compose"]
-        CS["clientes-service<br/>FastAPI :8001"]
-        CD[("clientes-db<br/>PostgreSQL")]
-        
-        ZS["zapatos-service<br/>FastAPI :8002"]
-        ZD[("zapatos-db<br/>PostgreSQL")]
-        
-        VS["ventas-service<br/>FastAPI :8003"]
-        VD[("ventas-db<br/>MongoDB")]
-    end
-
-    C -->|HTTP| CS
-    C -->|HTTP| ZS
-    C -->|HTTP| VS
-
-    CS -->|SQLAlchemy| CD
-    ZS -->|SQLAlchemy| ZD
-    VS -->|PyMongo| VD
-
-    VS -.->|HTTP GET validación cliente| CS
-    VS -.->|HTTP GET validación zapato| ZS
-    CS -.->|HTTP GET| ZS
-```
-
-### Responsabilidad de cada componente
-
-| Componente | Tecnología | Puerto | Responsabilidad |
-|---|---|---:|---|
-| `clientes-service` | FastAPI + SQLAlchemy | 8001 | CRUD y consulta de clientes |
-| `clientes-db` | PostgreSQL | Interno | Persistencia de clientes |
-| `zapatos-service` | FastAPI + SQLAlchemy | 8002 | CRUD y consulta de inventario |
-| `zapatos-db` | PostgreSQL | Interno | Persistencia de zapatos |
-| `ventas-service` | FastAPI + PyMongo | 8003 | Registro y consulta de ventas |
-| `ventas-db` | MongoDB | Interno | Persistencia documental de ventas |
-
-> Las bases de datos no están expuestas mediante puertos al host en el `docker-compose.yml`; los servicios se conectan a ellas por la red interna de Docker.
+Esta documentación representa la arquitectura del repositorio **Tiendazapatos** implementando el patrón **SAGA por Coreografía** con **RabbitMQ**, base de datos por servicio (**Database per Service**) y persistencia políglota.
 
 ---
 
-## 2. Diagrama de contenedores
+## 1. Arquitectura General y Broker de Mensajería
+
+El proyecto utiliza microservicios desacoplados donde cada servicio administra su propia base de datos y se comunican asíncronamente a través de eventos usando **RabbitMQ (AMQP)**:
 
 ```mermaid
-flowchart LR
-    subgraph Docker["Docker Compose"]
-        subgraph Clientes["Dominio Clientes"]
-            CS["clientes-service<br/>FastAPI :8001"]
-            CDB[("clientes-db<br/>PostgreSQL")]
-            CS --> CDB
+flowchart TB
+    Client[Cliente / Postman / Frontend]
+
+    subgraph DOCKER["Ecosistema Docker Compose"]
+        subgraph BROKER["Bus de Mensajería"]
+            RMQ[("RabbitMQ\nExchange: tienda.saga (Topic)\nPuertos: 5672 / 15672")]
         end
 
-        subgraph Zapatos["Dominio Zapatos"]
-            ZS["zapatos-service<br/>FastAPI :8002"]
-            ZDB[("zapatos-db<br/>PostgreSQL")]
-            ZS --> ZDB
-        end
-
-        subgraph Ventas["Dominio Ventas"]
+        subgraph S_VENTAS["Microservicio de Ventas"]
             VS["ventas-service<br/>FastAPI :8003"]
-            VDB[("ventas-db<br/>MongoDB")]
-            VS --> VDB
+            VD[("ventas-db<br/>MongoDB")]
+            VS -->|PyMongo| VD
         end
 
-        VS -->|GET /clientes/{id}| CS
-        VS -->|GET /zapatos/{id}| ZS
-        CS -->|GET /zapatos/{id}| ZS
-    end
-```
+        subgraph S_ZAPATOS["Microservicio de Zapatos"]
+            ZS["zapatos-service<br/>FastAPI :8002"]
+            ZD[("zapatos-db<br/>PostgreSQL")]
+            ZS -->|SQLAlchemy| ZD
+        end
 
-Cada pareja **servicio + base de datos** funciona como una unidad independiente. La integración entre dominios ocurre mediante HTTP, no mediante acceso directo a las bases de datos de otros servicios.
+        subgraph S_CLIENTES["Microservicio de Clientes"]
+            CS["clientes-service<br/>FastAPI :8001"]
+            CD[("clientes-db<br/>PostgreSQL")]
+            CS -->|SQLAlchemy| CD
+        end
+    end
+
+    Client -->|POST /ventas (HTTP)| VS
+    Client -->|POST /zapatos (HTTP)| ZS
+    Client -->|POST /clientes (HTTP)| CS
+
+    VS <==>|AMQP: venta.creada / pago.exitoso / cancelaciones| RMQ
+    ZS <==>|AMQP: stock.reservado / compensación de stock| RMQ
+    CS <==>|AMQP: debito de saldo / pago.fallido| RMQ
+
+    VS -.->|HTTP GET composición de lectura| CS
+    VS -.->|HTTP GET composición de lectura| ZS
+```
 
 ---
 
-## 3. Flujo para registrar una venta
+## 2. Componentes y Responsabilidades
 
-Cuando se ejecuta `POST /ventas`, el servicio de ventas primero valida las referencias y después guarda la venta.
+| Componente | Tecnología | Puerto | Rol en la SAGA |
+|---|---|---:|---|
+| `ventas-service` | FastAPI + PyMongo | 8003 | Inicia la transacción distribuida con estado `PENDIENTE`. Concluye a `CONFIRMADA` o `CANCELADA`. |
+| `ventas-db` | MongoDB | Interno | Persistencia documental de las ventas y su estado en la SAGA. |
+| `zapatos-service` | FastAPI + SQLAlchemy | 8002 | Valida y reserva stock (decrementa `cantidad_disponible`). Ejecuta **compensación semántica** (restituye stock si el pago falla). |
+| `zapatos-db` | PostgreSQL | Interno | Persistencia relacional de calzado e inventario. |
+| `clientes-service` | FastAPI + SQLAlchemy | 8001 | Valida la existencia del cliente y descuenta `saldo`. Si no alcanza, emite `pago.fallido`. |
+| `clientes-db` | PostgreSQL | Interno | Persistencia relacional de clientes y saldos. |
+| `rabbitmq` | RabbitMQ 3 Management | 5672 / 15672 | Bus de mensajería AMQP y panel de monitoreo visual. |
+
+---
+
+## 3. Diagrama de Secuencia: Transacción Exitosa (Happy Path)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Cliente as Cliente
+    actor C as Cliente / Frontend
     participant V as ventas-service :8003
-    participant C as clientes-service :8001
+    participant MQ as RabbitMQ (tienda.saga)
     participant Z as zapatos-service :8002
-    participant DB as ventas-db (MongoDB)
+    participant CL as clientes-service :8001
 
-    Cliente->>V: POST /ventas {id_cliente, id_zapato}
-    V->>C: GET /clientes/{id_cliente}
-    C-->>V: Cliente / error
-    V->>Z: GET /zapatos/{id_zapato}
-    Z-->>V: Zapato / error
+    C->>V: POST /ventas {id_cliente, id_zapato, cantidad}
+    V->>V: MongoDB insert (estado: PENDIENTE)
+    V-->>C: 202 Accepted {id_venta, estado: PENDIENTE}
+    V->>MQ: Evento 'venta.creada'
+    
+    MQ->>Z: Entrega 'venta.creada'
+    Z->>Z: Descuenta stock en PostgreSQL (Commit local)
+    Z->>MQ: Evento 'stock.reservado'
 
-    alt Cliente y zapato válidos
-        V->>DB: insertOne(venta)
-        DB-->>V: ObjectId
-        V-->>Cliente: 200 + VentaResponse
-    else Alguna referencia no es válida
-        V-->>Cliente: 400
-    else Fallo de comunicación
-        V-->>Cliente: 503
-    end
+    MQ->>CL: Entrega 'stock.reservado'
+    CL->>CL: Descuenta saldo en PostgreSQL (Commit local)
+    CL->>MQ: Evento 'pago.exitoso'
+
+    MQ->>V: Entrega 'pago.exitoso'
+    V->>V: Actualiza estado a 'CONFIRMADA' en MongoDB
 ```
-
-### Datos almacenados en una venta
-
-La colección `ventas` guarda principalmente:
-
-```text
-{
-  _id: ObjectId,
-  id_cliente: Integer,
-  id_zapato: Integer,
-  fecha: DateTime
-}
-```
-
-La información completa del cliente y del zapato se obtiene posteriormente mediante llamadas HTTP.
 
 ---
 
-## 4. Flujo para consultar ventas
+## 4. Diagrama de Secuencia: Transacción con Compensación (Rollback Semántico)
 
-El endpoint `GET /ventas` realiza una composición de datos: lee las ventas de MongoDB y consulta los otros servicios para completar cada resultado.
+Cuando el cliente no cuenta con saldo suficiente, la reserva de stock que ya fue confirmada (committed) en `zapatos-db` no se puede deshacer con un `ROLLBACK` SQL tradicional, por lo que se ejecuta una **transacción de compensación**:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Cliente as Cliente
+    actor C as Cliente / Frontend
     participant V as ventas-service :8003
-    participant DB as ventas-db
-    participant C as clientes-service :8001
+    participant MQ as RabbitMQ (tienda.saga)
     participant Z as zapatos-service :8002
+    participant CL as clientes-service :8001
 
-    Cliente->>V: GET /ventas
-    V->>DB: find()
-    DB-->>V: Lista de ventas
+    C->>V: POST /ventas {id_cliente: 2, id_zapato: 1, cantidad: 1}
+    V->>V: MongoDB insert (estado: PENDIENTE)
+    V-->>C: 202 Accepted {id_venta, estado: PENDIENTE}
+    V->>MQ: Evento 'venta.creada'
+    
+    MQ->>Z: Entrega 'venta.creada'
+    Z->>Z: Descuenta stock de 10 a 9 en PostgreSQL (Commit local)
+    Z->>MQ: Evento 'stock.reservado'
 
-    loop Por cada venta
-        V->>C: GET /clientes/{id_cliente}
-        C-->>V: Datos del cliente
-        V->>Z: GET /zapatos/{id_zapato}
-        Z-->>V: Datos del zapato
-        V->>V: Construye VentaDetalleResponse
+    MQ->>CL: Entrega 'stock.reservado'
+    CL->>CL: Verifica saldo: $50,000 < $250,000 (¡Saldo Insuficiente!)
+    CL->>MQ: Evento 'pago.fallido' (motivo: Saldo insuficiente)
+
+    par Compensación de Inventario
+        MQ->>Z: Entrega 'pago.fallido'
+        Note over Z: TRANSACCIÓN COMPENSATORIA<br/>Devuelve 1 al stock en PostgreSQL (9 -> 10)
+        Z->>Z: Commit de compensación
+        Z->>MQ: Evento 'stock.compensado'
+    and Cancelación de Venta
+        MQ->>V: Entrega 'pago.fallido'
+        V->>V: Actualiza estado a 'CANCELADA' en MongoDB
     end
-
-    V-->>Cliente: Lista consolidada
 ```
 
 ---
 
-## 5. Modelo de datos por servicio
+## 5. Diseño del Bus de Mensajería (RabbitMQ Topic Exchange)
 
-### Clientes
+* **Exchange:** `tienda.saga` (Tipo `topic`, durable: true)
 
-```mermaid
-erDiagram
-    CLIENTES {
-        int id PK
-        string nombre
-        string email UK
-        string telefono
-    }
-```
-
-### Zapatos
-
-```mermaid
-erDiagram
-    ZAPATOS {
-        int id_zapato PK
-        string marca
-        int talla
-        string color
-        decimal precio
-        int cantidad_disponible
-    }
-```
-
-### Ventas
-
-MongoDB utiliza documentos, por lo que no existe una tabla relacional equivalente:
-
-```mermaid
-erDiagram
-    VENTA {
-        ObjectId _id PK
-        int id_cliente FK
-        int id_zapato FK
-        datetime fecha
-    }
-```
-
-Las referencias `id_cliente` e `id_zapato` son **referencias lógicas entre servicios**, no claves foráneas de una base de datos compartida.
-
----
-
-## 6. Estructura interna de los servicios
-
-Los tres servicios siguen una estructura sencilla basada en FastAPI:
-
-```mermaid
-flowchart TB
-    API["FastAPI / main.py"]
-    SCH["schemas.py<br/>Validación y respuestas"]
-    MOD["models.py<br/>Modelos ORM"]
-    DB["database.py<br/>Conexión a BD"]
-    DATA[("Base de datos")]
-
-    API --> SCH
-    API --> MOD
-    API --> DB
-    MOD --> DB
-    DB --> DATA
-```
-
-En `ventas-service`, la persistencia usa MongoDB/PyMongo, por lo que no existe `models.py` como en los servicios basados en SQLAlchemy.
-
----
-
-## 7. Puertos y endpoints principales
-
-| Servicio | URL base | Endpoints principales |
+| Cola | Routing Keys Suscritas | Propósito |
 |---|---|---|
-| Clientes | `http://localhost:8001` | `GET /clientes`, `GET /clientes/{cliente_id}`, `POST /clientes` |
-| Zapatos | `http://localhost:8002` | `GET /zapatos`, `GET /zapatos/{id_zapato}`, `POST /zapatos` |
-| Ventas | `http://localhost:8003` | `GET /ventas`, `POST /ventas` |
-
-Además, FastAPI expone documentación Swagger en `/docs` para cada servicio.
-
----
-
-## 8. Arquitectura resumida
-
-```text
-                         ┌───────────────────┐
-                         │ Cliente / Postman │
-                         └─────────┬─────────┘
-                                   │ HTTP
-                ┌──────────────────┼──────────────────┐
-                ▼                   ▼                  ▼
-       ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-       │ clientes       │  │ zapatos        │  │ ventas         │
-       │ FastAPI :8001  │  │ FastAPI :8002  │  │ FastAPI :8003  │
-       └───────┬────────┘  └───────┬────────┘  └───────┬────────┘
-               │                   │                   │
-               ▼                   ▼                   ▼
-       ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-       │ PostgreSQL     │  │ PostgreSQL     │  │ MongoDB        │
-       │ clientes-db    │  │ zapatos-db     │  │ ventas-db      │
-       └────────────────┘  └────────────────┘  └────────────────┘
-               ▲                   ▲                   │
-               │                   │                   │
-               └──────── HTTP ─────┴────── HTTP ───────┘
-                         validaciones / composición
-```
-
-## 9. Decisiones arquitectónicas observables
-
-- **Database per Service:** cada microservicio posee su propia persistencia.
-- **Persistencia políglota:** PostgreSQL se usa para clientes y zapatos; MongoDB para ventas.
-- **Comunicación síncrona HTTP:** `httpx` permite que ventas consulte clientes y zapatos.
-- **Composición por API:** `GET /ventas` combina información proveniente de varios servicios.
-- **Contenedorización:** cada servicio y su base de datos se ejecutan mediante Docker Compose.
-- **Aislamiento:** un servicio no necesita conectarse directamente a la base de datos de otro servicio.
+| `cola_zapatos` | `venta.creada`, `pago.fallido` | Reserva de stock inicial y compensación de stock ante fallo en pago. |
+| `cola_clientes` | `stock.reservado` | Validación del cliente y cobro/débito de saldo. |
+| `cola_ventas` | `pago.exitoso`, `stock.rechazado`, `pago.fallido` | Actualización del estado terminal de la orden en MongoDB (`CONFIRMADA` o `CANCELADA`). |

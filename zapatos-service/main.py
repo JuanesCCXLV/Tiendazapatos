@@ -1,19 +1,29 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import engine, Base, get_db
 from models import Zapato
 from schemas import ZapatoCreate, ZapatoResponse
+from messaging import iniciar_consumidor
 
 
 # Crea las tablas que todavía no existan
 Base.metadata.create_all(bind=engine)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicia el consumidor de eventos SAGA (reserva y compensación de stock)
+    iniciar_consumidor()
+    yield
+
+
 app = FastAPI(
     title="Servicio de Zapatos",
     description="Microservicio encargado de administrar los zapatos",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 
@@ -22,6 +32,7 @@ def inicio():
     return {
         "mensaje": "Servicio de Zapatos funcionando"
     }
+
 
 
 @app.post("/zapatos", response_model= ZapatoResponse)
