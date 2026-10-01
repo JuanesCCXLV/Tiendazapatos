@@ -1,113 +1,109 @@
-# Tienda de Zapatos - Arquitectura de Microservicios
+# Tienda de Zapatos — Patrón SAGA por Orquestación
 
-Este proyecto es una demostración práctica de la arquitectura de **Microservicios utilizando el patrón "Database per Service" (Base de datos por servicio)** y persistencia políglota. Está desarrollado en Python con **FastAPI** y dockerizado para su fácil despliegue.
-
-## Arquitectura
-
-El sistema se compone de tres microservicios completamente independientes. Cada servicio expone su propia API y encapsula su base de datos privada:
-
-1. **Clientes Service** (`localhost:8001`) 
-   - Base de datos: **PostgreSQL** (`clientes-db`).
-   - Propósito: Manejo estricto relacional de los datos de los usuarios.
-2. **Zapatos Service** (`localhost:8002`)
-   - Base de datos: **PostgreSQL** (`zapatos-db`).
-   - Propósito: Control estricto relacional del inventario del calzado.
-3. **Ventas Service** (`localhost:8003`)
-   - Base de datos: **MongoDB** (`ventas-db`).
-   - Propósito: Base de datos documental (NoSQL) para almacenar recibos y transacciones ágilmente. Se comunica por peticiones HTTP internas con los otros nodos para validar la existencia de clientes y zapatos (Composición por API).
+Implementación de una arquitectura de **Microservicios con el patrón SAGA por Orquestación**, persistencia políglota (**Database per Service**) y bus de mensajería asíncrona orientado a **Comandos y Respuestas sobre RabbitMQ**.
 
 ---
 
-## Cómo Ejecutar el Proyecto
+## 🏛️ Arquitectura del Sistema
 
-Asegúrate de tener Docker y Docker Compose instalados en tu computadora. En la terminal, dirígete a la carpeta raíz (donde se encuentra `docker-compose.yml`) y levanta todo el ecosistema con:
+El ecosistema cuenta con un **Orquestador Central** (`orquestador-service`) que actúa como director de orquesta coordinando las transacciones mediante una **Máquina de Estados Finita**:
+
+1. **Orquestador Service (`localhost:8004`)**
+   - **Rol:** Director central de la SAGA. Mantiene la máquina de estados, el registro de auditoría (*Saga Log*) y orquesta las compensaciones (Rollback Semántico).
+2. **Zapatos Service (`localhost:8002`)**
+   - **Base de datos:** **PostgreSQL** (`zapatos-db`).
+   - **Rol:** Atiende `comando.zapatos.reservar` (reserva de inventario) y la compensación `comando.zapatos.liberar` (restitución de inventario).
+3. **Clientes Service (`localhost:8001`)**
+   - **Base de datos:** **PostgreSQL** (`clientes-db`).
+   - **Rol:** Atiende `comando.clientes.cobrar` (débito de saldo). Valida fondos y responde éxito o rechazo por saldo insuficiente.
+4. **Ventas Service (`localhost:8003`)**
+   - **Base de datos:** **MongoDB** (`ventas-db`).
+   - **Rol:** Atiende `comando.ventas.confirmar` y `comando.ventas.cancelar` para almacenar el recibo documental con su estado final.
+5. **RabbitMQ (`localhost:5672` / UI: `localhost:15672`)**
+   - **Rol:** Bus AMQP para el desacoplamiento mediante colas dedicadas de comandos y respuestas directas.
+
+---
+
+## 🚀 Cómo Ejecutar el Proyecto
+
+### Opción A: Demostración Rápida en Terminal (Sin Docker)
+Para exponer o validar el flujo inmediatamente con animación de logs en consola:
+
+```bash
+python simular_saga.py
+```
+
+### Opción B: Despliegue Completo con Docker Compose
+Asegúrate de tener Docker instalado y ejecuta:
 
 ```bash
 docker compose up --build
 ```
-> *Nota:* La primera vez puede tardar unos minutos descargando las imágenes oficiales de Python, PostgreSQL y MongoDB.
 
 ---
 
-## Flujo Funcional (Paso a Paso en Postman o cURL)
+## 🧪 Pruebas Paso a Paso con cURL / Postman / Swagger
 
-Para probar correctamente la integración, la base de datos empezará en blanco. Deberás seguir este orden lógico para completar una venta:
+### Escenario 1: Camino Feliz (Compra Exitosa de Samuel)
+Samuel (ID: 1) cuenta con $500.000 de saldo y compra el zapato Nike Air Force (ID: 1) de $250.000:
 
-### Paso 1: Crea un Zapato nuevo en el inventario
-Contacta únicamente a la API de zapatos para crear calzado.
-
-* **URL:** `POST http://localhost:8002/zapatos`
-* **Cuerpo (JSON raw):**
-```json
-{
-  "marca": "Nike Air Force",
-  "talla": 39.5,
-  "color": "Blanco",
-  "precio": 250000.0,
-  "cantidad_disponible": 15
-}
-```
-*Si fue exitoso, te devolverá el JSON comprobando la inserción. (Supongamos que le asignan el ID `1`).*
-
-### Paso 2: Registra a un nuevo Cliente
-Contacta únicamente a la API de clientes.
-
-* **URL:** `POST http://localhost:8001/clientes`
-* **Cuerpo (JSON raw):**
-```json
-{
-  "nombre": "Samuel L.",
-  "email": "samuel@ejemplo.com",
-  "telefono": "3000000000"
-}
-```
-*Si fue exitoso, devuelve al cliente. (Supongamos que le asignan el ID `1`).*
-
-### Paso 3: Genera la Venta
-Contacta a la API de ventas. Este servicio intentará comunicarse en secreto de fondo con el servicio de clientes y con el de zapatos para validar que el `id` 1 de cada uno sí es real. 
-
-* **URL:** `POST http://localhost:8003/ventas`
-* **Cuerpo (JSON raw):**
-*(Simulando que el cliente 1 compró el zapato 1)*
+* **URL:** `POST http://localhost:8004/saga/comprar`
+* **Body:**
 ```json
 {
   "id_cliente": 1,
-  "id_zapato": 1
+  "id_zapato": 1,
+  "cantidad": 1
 }
 ```
-*Si un `id` fuera falso o inventado, el servicio de ventas interceptaría el fallo HTTP y te respondería un Status 400. Al ser correcto, MongoDB inyectará la venta y generará un ObjectID automático alfanumérico.*
-
-### Paso 4: Visualiza las Ventas Consolidadas
-Realiza una petición de lectura sobre el servicio de ventas. Este consultará a MongoDB, pero a su vez lanzará múltiples peticiones Get HTTP paralelas a clientes y zapatos para inyectar su información (Composición de API) en el JSON final.
-
-* **URL:** `GET http://localhost:8003/ventas`
-* **Respuesta Esperada:**
+* **Respuesta Inmediata (HTTP 202 Accepted):**
 ```json
-[
-  {
-    "id": "64bcdeea0f23a88a100a00bc",
-    "fecha": "2026-09-23T23:45:10.053000",
-    "cliente": {
-      "id": 1,
-      "email": "samuel@ejemplo.com",
-      "telefono": "3000000000",
-      "nombre": "Samuel L."
-    },
-    "zapato": {
-      "id_zapato": 1,
-      "precio": 250000.0,
-      "color": "Blanco",
-      "cantidad_disponible": 15,
-      "marca": "Nike Air Force",
-      "talla": 39.5
-    }
-  }
-]
+{
+  "id_saga": "saga-8a100a00bc",
+  "estado": "INICIADA",
+  "mensaje": "SAGA iniciada. El Orquestador central está coordinando la transacción."
+}
 ```
 
-## Re-documentación Automática (Swagger)
-FastAPI auto-documenta todos los endpoints. Para explorar y testear en interfaz gráfica (sin usar Postman), puedes abrir directamente tu navegador en:
+* **Consultar Estado de la Transacción:**
+`GET http://localhost:8004/saga/saga-8a100a00bc`
+Verás el estado en `COMPLETADA` y el historial cronológico de cada paso.
 
-- Zapatos Docs: [http://localhost:8002/docs](http://localhost:8002/docs)
-- Clientes Docs: [http://localhost:8001/docs](http://localhost:8001/docs)
-- Ventas Docs: [http://localhost:8003/docs](http://localhost:8003/docs)
+---
+
+### Escenario 2: Fallo de Pago y Rollback Semántico (Carlos Pobre)
+Carlos (ID: 2) cuenta con únicamente $50.000 de saldo e intenta comprar un zapato de $250.000:
+
+* **URL:** `POST http://localhost:8004/saga/comprar`
+* **Body:**
+```json
+{
+  "id_cliente": 2,
+  "id_zapato": 1,
+  "cantidad": 1
+}
+```
+* **Flujo Automático del Orquestador:**
+  1. Envía comando de reserva a Zapatos -> Zapatos descuenta stock de 9 a 8.
+  2. Envía comando de cobro a Clientes -> Clientes rechaza por fondos insuficientes.
+  3. **Rollback Semántico:** El Orquestador detecta el fallo, revisa que Zapatos ya había reservado, y despacha `comando.zapatos.liberar`.
+  4. Zapatos repone el stock de 8 a 9.
+  5. Ventas marca el pedido como `CANCELADA` (Motivo: Saldo insuficiente).
+  6. SAGA concluye en estado `CANCELADA` con inventario a salvo y total consistencia.
+
+---
+
+## 📚 Documentación y Material de Exposición
+
+* 📖 **Diagramas y Arquitectura Técnica:** [docs/arquitectura.md](file:///B:/Projects/Ejemplo_DSIII/Tiendazapatos/docs/arquitectura.md)
+* 🎤 **Guía de Diapositivas y Qué Decir en la Exposición:** [docs/presentacion_orquestada.md](file:///B:/Projects/Ejemplo_DSIII/Tiendazapatos/docs/presentacion_orquestada.md)
+
+---
+
+## 🌐 Interfaces Gráficas y Documentación Interactiva
+
+- **Orquestador API Docs:** [http://localhost:8004/docs](http://localhost:8004/docs)
+- **Ventas API Docs:** [http://localhost:8003/docs](http://localhost:8003/docs)
+- **Zapatos API Docs:** [http://localhost:8002/docs](http://localhost:8002/docs)
+- **Clientes API Docs:** [http://localhost:8001/docs](http://localhost:8001/docs)
+- **RabbitMQ Dashboard:** [http://localhost:15672](http://localhost:15672) *(admin / admin123)*

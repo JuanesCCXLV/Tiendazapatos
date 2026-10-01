@@ -1,9 +1,10 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from database import engine, Base, get_db
+from database import engine, Base, get_db, SessionLocal
 from models import Zapato
 from schemas import ZapatoCreate, ZapatoResponse
+from messaging import iniciar_consumidor
 
 
 # Crea las tablas que todavía no existan
@@ -11,20 +12,51 @@ Base.metadata.create_all(bind=engine)
 
 
 app = FastAPI(
-    title="Servicio de Zapatos",
-    description="Microservicio encargado de administrar los zapatos",
-    version="1.0.0"
+    title="Servicio de Zapatos (SAGA Orquestada)",
+    description="Microservicio de inventario de calzado: ejecuta comandos directos de reserva y liberación (compensación)",
+    version="2.0.0"
 )
+
+
+def seed_zapatos_demo():
+    """Siembra zapatos de prueba si la base de datos está vacía."""
+    db = SessionLocal()
+    try:
+        count = db.query(Zapato).count()
+        if count == 0:
+            z1 = Zapato(
+                id_zapato=1,
+                marca="Nike Air Force",
+                talla=40,
+                color="Blanco",
+                precio=250000.0,
+                cantidad_disponible=10
+            )
+            db.add(z1)
+            db.commit()
+            print("[Zapatos SEED] Zapato de prueba sembrado: Nike Air Force (Stock: 10, Precio: $250.000)")
+    except Exception as e:
+        db.rollback()
+        print(f"[Zapatos SEED Error]: {e}")
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+def startup_event():
+    seed_zapatos_demo()
+    iniciar_consumidor()
 
 
 @app.get("/")
 def inicio():
     return {
-        "mensaje": "Servicio de Zapatos funcionando"
+        "mensaje": "Servicio de Zapatos funcionando en modo SAGA Orquestada",
+        "rol_saga": "Participante: atiende comandos 'comando.zapatos.reservar' y 'comando.zapatos.liberar'"
     }
 
 
-@app.post("/zapatos", response_model= ZapatoResponse)
+@app.post("/zapatos", response_model=ZapatoResponse)
 def crear_zapato(
     zapato: ZapatoCreate,
     db: Session = Depends(get_db)
@@ -66,6 +98,4 @@ def obtener_zapato(
 def obtener_zapatos(
     db: Session = Depends(get_db)
 ):
-    zapatos = db.query(Zapato).all()
-
-    return zapatos
+    return db.query(Zapato).all()

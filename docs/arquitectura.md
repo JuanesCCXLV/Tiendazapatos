@@ -1,275 +1,219 @@
-# Diagramación de la arquitectura
+# Diagramación de la Arquitectura - Patrón SAGA (Orquestación)
 
-Esta documentación representa la arquitectura actual del repositorio **Tiendazapatos** a partir de los servicios y del `docker-compose.yml`.
-
-## 1. Arquitectura general
-
-El proyecto utiliza una arquitectura de **microservicios** con el patrón **Database per Service**. Cada microservicio tiene su propia base de datos y no comparte directamente las tablas/colecciones con los demás.
-
-```mermaid
-flowchart TB
-    C[Cliente / Postman / Frontend]
-
-    subgraph APP["Tienda de Zapatos - Docker Compose"]
-        CS["clientes-service<br/>FastAPI :8001"]
-        CD[("clientes-db<br/>PostgreSQL")]
-        
-        ZS["zapatos-service<br/>FastAPI :8002"]
-        ZD[("zapatos-db<br/>PostgreSQL")]
-        
-        VS["ventas-service<br/>FastAPI :8003"]
-        VD[("ventas-db<br/>MongoDB")]
-    end
-
-    C -->|HTTP| CS
-    C -->|HTTP| ZS
-    C -->|HTTP| VS
-
-    CS -->|SQLAlchemy| CD
-    ZS -->|SQLAlchemy| ZD
-    VS -->|PyMongo| VD
-
-    VS -.->|HTTP GET validación cliente| CS
-    VS -.->|HTTP GET validación zapato| ZS
-    CS -.->|HTTP GET| ZS
-```
-
-### Responsabilidad de cada componente
-
-| Componente | Tecnología | Puerto | Responsabilidad |
-|---|---|---:|---|
-| `clientes-service` | FastAPI + SQLAlchemy | 8001 | CRUD y consulta de clientes |
-| `clientes-db` | PostgreSQL | Interno | Persistencia de clientes |
-| `zapatos-service` | FastAPI + SQLAlchemy | 8002 | CRUD y consulta de inventario |
-| `zapatos-db` | PostgreSQL | Interno | Persistencia de zapatos |
-| `ventas-service` | FastAPI + PyMongo | 8003 | Registro y consulta de ventas |
-| `ventas-db` | MongoDB | Interno | Persistencia documental de ventas |
-
-> Las bases de datos no están expuestas mediante puertos al host en el `docker-compose.yml`; los servicios se conectan a ellas por la red interna de Docker.
+Esta documentación detalla la arquitectura del sistema **Tiendazapatos** implementando el patrón **SAGA por Orquestación** mediante un **Orquestador Central (State Machine)**, mensajería orientada a **Comandos y Respuestas con RabbitMQ**, y persistencia políglota bajo el principio **Database per Service**.
 
 ---
 
-## 2. Diagrama de contenedores
+## 1. Arquitectura General y Director Central
+
+A diferencia de la coreografía donde los servicios reaccionan de manera reactiva y distribuida a eventos globales, en la **Orquestación** existe un director central: el `orquestador-service`. Este servicio modela una **Máquina de Estados Finita (FSM)** y conoce la totalidad del flujo del proceso de negocio:
 
 ```mermaid
-flowchart LR
-    subgraph Docker["Docker Compose"]
-        subgraph Clientes["Dominio Clientes"]
-            CS["clientes-service<br/>FastAPI :8001"]
-            CDB[("clientes-db<br/>PostgreSQL")]
-            CS --> CDB
+flowchart TB
+    Client[Cliente / Frontend / Swagger]
+
+    subgraph DOCKER["Ecosistema Docker Compose"]
+        subgraph ORCH["Director Central de la Transacción"]
+            ORQ["orquestador-service<br/>FastAPI :8004<br/>(Máquina de Estados / Saga Log)"]
         end
 
-        subgraph Zapatos["Dominio Zapatos"]
+        subgraph BROKER["Bus de Mensajería (RabbitMQ :5672 / :15672)"]
+            EX["Exchange: tienda.saga.orquestada (Topic)"]
+            Q_ORQ["cola_orquestador_respuestas"]
+            Q_ZAP["cola_comandos_zapatos"]
+            Q_CLI["cola_comandos_clientes"]
+            Q_VEN["cola_comandos_ventas"]
+        end
+
+        subgraph S_ZAPATOS["Microservicio de Zapatos"]
             ZS["zapatos-service<br/>FastAPI :8002"]
-            ZDB[("zapatos-db<br/>PostgreSQL")]
-            ZS --> ZDB
+            ZD[("zapatos-db<br/>PostgreSQL")]
+            ZS -->|SQLAlchemy| ZD
         end
 
-        subgraph Ventas["Dominio Ventas"]
+        subgraph S_CLIENTES["Microservicio de Clientes"]
+            CS["clientes-service<br/>FastAPI :8001"]
+            CD[("clientes-db<br/>PostgreSQL")]
+            CS -->|SQLAlchemy| CD
+        end
+
+        subgraph S_VENTAS["Microservicio de Ventas"]
             VS["ventas-service<br/>FastAPI :8003"]
-            VDB[("ventas-db<br/>MongoDB")]
-            VS --> VDB
+            VD[("ventas-db<br/>MongoDB")]
+            VS -->|PyMongo| VD
         end
-
-        VS -->|GET /clientes/{id}| CS
-        VS -->|GET /zapatos/{id}| ZS
-        CS -->|GET /zapatos/{id}| ZS
     end
-```
 
-Cada pareja **servicio + base de datos** funciona como una unidad independiente. La integración entre dominios ocurre mediante HTTP, no mediante acceso directo a las bases de datos de otros servicios.
+    Client -->|POST /saga/comprar (HTTP 202)| ORQ
+
+    %% Orquestador despacha comandos
+    ORQ ==>|1. Publica Comandos| EX
+    EX -->|comando.zapatos.*| Q_ZAP --> ZS
+    EX -->|comando.clientes.*| Q_CLI --> CS
+    EX -->|comando.ventas.*| Q_VEN --> VS
+
+    %% Participantes responden al orquestador
+    ZS ==>|2. respuesta.zapatos.*| EX
+    CS ==>|2. respuesta.clientes.*| EX
+    VS ==>|2. respuesta.ventas.*| EX
+    EX --> Q_ORQ ==>|3. Notifica Respuesta| ORQ
+```
 
 ---
 
-## 3. Flujo para registrar una venta
+## 2. Componentes y Responsabilidades
 
-Cuando se ejecuta `POST /ventas`, el servicio de ventas primero valida las referencias y después guarda la venta.
+| Componente | Tecnología | Puerto | Rol en la SAGA Orquestada |
+|---|---|---:|---|
+| `orquestador-service` | FastAPI + Pika | 8004 | **Director Central:** Mantiene la máquina de estados, el registro de auditoría (*Saga Execution Log*), despacha comandos directos y orquesta compensaciones. |
+| `zapatos-service` | FastAPI + SQLAlchemy | 8002 | **Participante:** Ejecuta `comando.zapatos.reservar` (resta inventario) y la compensación `comando.zapatos.liberar` (restituye inventario). Responde directamente al orquestador. |
+| `zapatos-db` | PostgreSQL | Interno | Persistencia relacional de calzado y stock disponible. |
+| `clientes-service` | FastAPI + SQLAlchemy | 8001 | **Participante:** Ejecuta `comando.clientes.cobrar` (debitando saldo). Responde OK o Fallo (Saldo insuficiente) directamente al orquestador. |
+| `clientes-db` | PostgreSQL | Interno | Persistencia relacional de clientes y saldos monetarios. |
+| `ventas-service` | FastAPI + PyMongo | 8003 | **Participante:** Registra la orden y ejecuta `comando.ventas.confirmar` o `comando.ventas.cancelar` según la directriz final del orquestador. |
+| `ventas-db` | MongoDB | Interno | Persistencia documental de recibos y auditoría de pedidos. |
+| `rabbitmq` | RabbitMQ Management | 5672 / 15672 | Bus AMQP que desacopla la comunicación punto a punto de comandos y respuestas mediante colas dedicadas. |
+
+---
+
+## 3. Máquina de Estados del Orquestador
+
+El orquestador gestiona el ciclo de vida de cada transacción distribuida como una máquina de estados determinista:
+
+```mermaid
+stateDiagram-v2
+    [*] --> INICIADA: POST /saga/comprar
+    INICIADA --> RESERVANDO_STOCK: Despachar comando.zapatos.reservar
+    
+    RESERVANDO_STOCK --> STOCK_RESERVADO: respuesta.zapatos.reservado (OK)
+    RESERVANDO_STOCK --> CANCELADA: respuesta.zapatos.fallo (Sin stock)
+    
+    STOCK_RESERVADO --> PROCESANDO_PAGO: Despachar comando.clientes.cobrar
+    
+    PROCESANDO_PAGO --> PAGO_EXITOSO: respuesta.clientes.cobrado (OK)
+    PROCESANDO_PAGO --> COMPENSANDO_STOCK: respuesta.clientes.fallo (Saldo insuficiente)
+    
+    %% Camino Feliz
+    PAGO_EXITOSO --> CONFIRMANDO_VENTA: Despachar comando.ventas.confirmar
+    CONFIRMANDO_VENTA --> COMPLETADA: respuesta.ventas.confirmada
+    COMPLETADA --> [*]
+
+    %% Camino con Rollback Semántico
+    COMPENSANDO_STOCK --> STOCK_COMPENSADO: respuesta.zapatos.liberado (Compensado)
+    STOCK_COMPENSADO --> CANCELANDO_VENTA: Despachar comando.ventas.cancelar
+    CANCELANDO_VENTA --> CANCELADA: respuesta.ventas.cancelada
+    CANCELADA --> [*]
+```
+
+---
+
+## 4. Diagrama de Secuencia: Caso Práctico 1 — Camino Feliz (Éxito)
+
+Cliente **Samuel L.** ($500.000 de saldo) compra un zapato Nike Air Force ($250.000):
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Cliente as Cliente
-    participant V as ventas-service :8003
-    participant C as clientes-service :8001
-    participant Z as zapatos-service :8002
-    participant DB as ventas-db (MongoDB)
+    actor Cliente as Cliente / Frontend
+    participant ORQ as orquestador-service :8004
+    participant MQ as RabbitMQ
+    participant ZAP as zapatos-service :8002
+    participant CLI as clientes-service :8001
+    participant VEN as ventas-service :8003
 
-    Cliente->>V: POST /ventas {id_cliente, id_zapato}
-    V->>C: GET /clientes/{id_cliente}
-    C-->>V: Cliente / error
-    V->>Z: GET /zapatos/{id_zapato}
-    Z-->>V: Zapato / error
+    Cliente->>ORQ: POST /saga/comprar {id_cliente: 1, id_zapato: 1, cantidad: 1}
+    ORQ->>ORQ: Inicializa SAGA en Máquina de Estados (INICIADA)
+    ORQ-->>Cliente: 202 Accepted {id_saga: "saga-xxx", estado: "INICIADA"}
 
-    alt Cliente y zapato válidos
-        V->>DB: insertOne(venta)
-        DB-->>V: ObjectId
-        V-->>Cliente: 200 + VentaResponse
-    else Alguna referencia no es válida
-        V-->>Cliente: 400
-    else Fallo de comunicación
-        V-->>Cliente: 503
-    end
+    %% Paso 1: Zapatos
+    ORQ->>MQ: COMANDO: 'comando.zapatos.reservar'
+    MQ->>ZAP: Entrega a cola_comandos_zapatos
+    ZAP->>ZAP: PostgreSQL: Stock 10 -> 9 (Commit local)
+    ZAP->>MQ: RESPUESTA: 'respuesta.zapatos.reservado' (OK, monto: $250.000)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
+
+    %% Paso 2: Clientes
+    Note over ORQ: Transición -> STOCK_RESERVADO.<br/>Avanza a cobro.
+    ORQ->>MQ: COMANDO: 'comando.clientes.cobrar' (Monto: $250.000)
+    MQ->>CLI: Entrega a cola_comandos_clientes
+    CLI->>CLI: PostgreSQL: Saldo $500.000 -> $250.000 (Commit local)
+    CLI->>MQ: RESPUESTA: 'respuesta.clientes.cobrado' (OK)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
+
+    %% Paso 3: Ventas
+    Note over ORQ: Transición -> PAGO_EXITOSO.<br/>Avanza a confirmación.
+    ORQ->>MQ: COMANDO: 'comando.ventas.confirmar'
+    MQ->>VEN: Entrega a cola_comandos_ventas
+    VEN->>VEN: MongoDB: Registra venta CONFIRMADA
+    VEN->>MQ: RESPUESTA: 'respuesta.ventas.confirmada' (OK)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
+
+    Note over ORQ: Transición -> COMPLETADA.<br/>SAGA Finalizada exitosamente.
 ```
-
-### Datos almacenados en una venta
-
-La colección `ventas` guarda principalmente:
-
-```text
-{
-  _id: ObjectId,
-  id_cliente: Integer,
-  id_zapato: Integer,
-  fecha: DateTime
-}
-```
-
-La información completa del cliente y del zapato se obtiene posteriormente mediante llamadas HTTP.
 
 ---
 
-## 4. Flujo para consultar ventas
+## 5. Diagrama de Secuencia: Caso Práctico 2 — Fallo y Rollback Semántico
 
-El endpoint `GET /ventas` realiza una composición de datos: lee las ventas de MongoDB y consulta los otros servicios para completar cada resultado.
+Cliente **Carlos Pobre** ($50.000 de saldo) intenta comprar zapato de $250.000:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Cliente as Cliente
-    participant V as ventas-service :8003
-    participant DB as ventas-db
-    participant C as clientes-service :8001
-    participant Z as zapatos-service :8002
+    actor Cliente as Cliente / Frontend
+    participant ORQ as orquestador-service :8004
+    participant MQ as RabbitMQ
+    participant ZAP as zapatos-service :8002
+    participant CLI as clientes-service :8001
+    participant VEN as ventas-service :8003
 
-    Cliente->>V: GET /ventas
-    V->>DB: find()
-    DB-->>V: Lista de ventas
+    Cliente->>ORQ: POST /saga/comprar {id_cliente: 2, id_zapato: 1, cantidad: 1}
+    ORQ->>ORQ: Inicializa SAGA (id_saga: "saga-yyy")
+    ORQ-->>Cliente: 202 Accepted
 
-    loop Por cada venta
-        V->>C: GET /clientes/{id_cliente}
-        C-->>V: Datos del cliente
-        V->>Z: GET /zapatos/{id_zapato}
-        Z-->>V: Datos del zapato
-        V->>V: Construye VentaDetalleResponse
-    end
+    %% Paso 1: Reserva de stock
+    ORQ->>MQ: COMANDO: 'comando.zapatos.reservar'
+    MQ->>ZAP: Entrega a cola_comandos_zapatos
+    ZAP->>ZAP: PostgreSQL: Stock 9 -> 8 (Commit local)
+    ZAP->>MQ: RESPUESTA: 'respuesta.zapatos.reservado' (OK)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
 
-    V-->>Cliente: Lista consolidada
+    %% Paso 2: Cobro fallido
+    Note over ORQ: Registra paso 1 exitoso en Saga Log.<br/>Despacha cobro.
+    ORQ->>MQ: COMANDO: 'comando.clientes.cobrar' (Monto: $250.000)
+    MQ->>CLI: Entrega a cola_comandos_clientes
+    CLI->>CLI: PostgreSQL: Saldo insuficiente ($50.000 < $250.000)
+    CLI->>MQ: RESPUESTA: 'respuesta.clientes.fallo' (ERROR: Saldo insuficiente)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
+
+    %% Paso 3: El Orquestador activa el Rollback Semántico
+    Note over ORQ: CONTROL CENTRAL DE ROLLBACK:<br/>El historial indica que Zapatos hizo reserva.<br/>Dispara compensación en orden inverso.
+    ORQ->>MQ: COMANDO COMPENSATORIO: 'comando.zapatos.liberar'
+    MQ->>ZAP: Entrega a cola_comandos_zapatos
+    Note over ZAP: COMPENSACIÓN SEMÁNTICA:<br/>PostgreSQL: Stock 8 -> 9 (+1 unidad)
+    ZAP->>MQ: RESPUESTA: 'respuesta.zapatos.liberado' (COMPENSADO)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
+
+    %% Paso 4: Cancelación en Ventas
+    Note over ORQ: Transición -> STOCK_COMPENSADO.<br/>Cierra orden.
+    ORQ->>MQ: COMANDO: 'comando.ventas.cancelar' (Motivo: Saldo insuficiente)
+    MQ->>VEN: Entrega a cola_comandos_ventas
+    VEN->>VEN: MongoDB: Marca venta CANCELADA
+    VEN->>MQ: RESPUESTA: 'respuesta.ventas.cancelada' (OK)
+    MQ->>ORQ: Entrega a cola_orquestador_respuestas
+
+    Note over ORQ: Transición -> CANCELADA.<br/>Rollback concluido, estado consistente.
 ```
 
 ---
 
-## 5. Modelo de datos por servicio
+## 6. Cuadro Comparativo: Coreografía vs. Orquestación
 
-### Clientes
-
-```mermaid
-erDiagram
-    CLIENTES {
-        int id PK
-        string nombre
-        string email UK
-        string telefono
-    }
-```
-
-### Zapatos
-
-```mermaid
-erDiagram
-    ZAPATOS {
-        int id_zapato PK
-        string marca
-        int talla
-        string color
-        decimal precio
-        int cantidad_disponible
-    }
-```
-
-### Ventas
-
-MongoDB utiliza documentos, por lo que no existe una tabla relacional equivalente:
-
-```mermaid
-erDiagram
-    VENTA {
-        ObjectId _id PK
-        int id_cliente FK
-        int id_zapato FK
-        datetime fecha
-    }
-```
-
-Las referencias `id_cliente` e `id_zapato` son **referencias lógicas entre servicios**, no claves foráneas de una base de datos compartida.
-
----
-
-## 6. Estructura interna de los servicios
-
-Los tres servicios siguen una estructura sencilla basada en FastAPI:
-
-```mermaid
-flowchart TB
-    API["FastAPI / main.py"]
-    SCH["schemas.py<br/>Validación y respuestas"]
-    MOD["models.py<br/>Modelos ORM"]
-    DB["database.py<br/>Conexión a BD"]
-    DATA[("Base de datos")]
-
-    API --> SCH
-    API --> MOD
-    API --> DB
-    MOD --> DB
-    DB --> DATA
-```
-
-En `ventas-service`, la persistencia usa MongoDB/PyMongo, por lo que no existe `models.py` como en los servicios basados en SQLAlchemy.
-
----
-
-## 7. Puertos y endpoints principales
-
-| Servicio | URL base | Endpoints principales |
+| Aspecto | SAGA por Coreografía | SAGA por Orquestación (Este Proyecto) |
 |---|---|---|
-| Clientes | `http://localhost:8001` | `GET /clientes`, `GET /clientes/{cliente_id}`, `POST /clientes` |
-| Zapatos | `http://localhost:8002` | `GET /zapatos`, `GET /zapatos/{id_zapato}`, `POST /zapatos` |
-| Ventas | `http://localhost:8003` | `GET /ventas`, `POST /ventas` |
-
-Además, FastAPI expone documentación Swagger en `/docs` para cada servicio.
-
----
-
-## 8. Arquitectura resumida
-
-```text
-                         ┌───────────────────┐
-                         │ Cliente / Postman │
-                         └─────────┬─────────┘
-                                   │ HTTP
-                ┌──────────────────┼──────────────────┐
-                ▼                   ▼                  ▼
-       ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-       │ clientes       │  │ zapatos        │  │ ventas         │
-       │ FastAPI :8001  │  │ FastAPI :8002  │  │ FastAPI :8003  │
-       └───────┬────────┘  └───────┬────────┘  └───────┬────────┘
-               │                   │                   │
-               ▼                   ▼                   ▼
-       ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-       │ PostgreSQL     │  │ PostgreSQL     │  │ MongoDB        │
-       │ clientes-db    │  │ zapatos-db     │  │ ventas-db      │
-       └────────────────┘  └────────────────┘  └────────────────┘
-               ▲                   ▲                   │
-               │                   │                   │
-               └──────── HTTP ─────┴────── HTTP ───────┘
-                         validaciones / composición
-```
-
-## 9. Decisiones arquitectónicas observables
-
-- **Database per Service:** cada microservicio posee su propia persistencia.
-- **Persistencia políglota:** PostgreSQL se usa para clientes y zapatos; MongoDB para ventas.
-- **Comunicación síncrona HTTP:** `httpx` permite que ventas consulte clientes y zapatos.
-- **Composición por API:** `GET /ventas` combina información proveniente de varios servicios.
-- **Contenedorización:** cada servicio y su base de datos se ejecutan mediante Docker Compose.
-- **Aislamiento:** un servicio no necesita conectarse directamente a la base de datos de otro servicio.
+| **Control del Flujo** | Descentralizado; cada microservicio reacciona a eventos de otros. | **Centralizado**; el Orquestador es el único que conoce el mapa completo. |
+| **Tipo de Mensajería** | **Eventos de Dominio** broadcast (`venta.creada`, `stock.reservado`). | **Comandos Directos y Respuestas** (`comando.*` y `respuesta.*`). |
+| **Complejidad en los Servicios** | Alta; cada servicio debe conocer qué eventos escuchar y cuándo compensar. | **Baja**; los servicios solo ejecutan instrucciones simples y reportan el resultado. |
+| **Rollback Semántico** | Las compensaciones están dispersas en múltiples servicios (*cascada reactiva*). | **Unificado**; el Orquestador decide qué, cuándo y en qué orden compensar. |
+| **Visibilidad y Monitoreo** | Difícil de rastrear sin tracing distribuido (OpenTelemetry / Jaeger). | **Inmediata**; el estado de cada transacción está disponible en `GET /saga/{id_saga}`. |
+| **Punto Único de Lógica** | No hay; la lógica de negocio distribuida está distribuida. | El Orquestador concentra las reglas de coordinación de la transacción. |

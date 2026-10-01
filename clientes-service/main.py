@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
-import httpx 
+import httpx
 
-from database import engine, Base, get_db
+from database import engine, Base, get_db, SessionLocal
 from models import Cliente
 from schemas import ClienteCreate, ClienteResponse
+from messaging import iniciar_consumidor
 
 
 # Crea las tablas que todavía no existan
@@ -12,16 +13,41 @@ Base.metadata.create_all(bind=engine)
 
 
 app = FastAPI(
-    title="Servicio de Clientes",
-    description="Microservicio encargado de administrar los clientes de la tienda de zapatos",
-    version="1.0.0"
+    title="Servicio de Clientes (SAGA Orquestada)",
+    description="Microservicio de clientes: ejecuta comandos directos de cobro instruidos por el Orquestador",
+    version="2.0.0"
 )
+
+
+def seed_clientes_demo():
+    """Siembra los clientes de prueba para los escenarios de la SAGA si la tabla está vacía."""
+    db = SessionLocal()
+    try:
+        count = db.query(Cliente).count()
+        if count == 0:
+            c1 = Cliente(id=1, nombre="Samuel L.", email="samuel@ejemplo.com", telefono="3000000000", saldo=500000.0)
+            c2 = Cliente(id=2, nombre="Carlos Pobre", email="carlos@ejemplo.com", telefono="3111111111", saldo=50000.0)
+            db.add_all([c1, c2])
+            db.commit()
+            print("[Clientes SEED] Clientes de prueba sembrados: Samuel ($500.000) y Carlos ($50.000)")
+    except Exception as e:
+        db.rollback()
+        print(f"[Clientes SEED Error]: {e}")
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+def startup_event():
+    seed_clientes_demo()
+    iniciar_consumidor()
 
 
 @app.get("/")
 def inicio():
     return {
-        "mensaje": "Servicio de Clientes funcionando"
+        "mensaje": "Servicio de Clientes funcionando en modo SAGA Orquestada",
+        "rol_saga": "Participante: atiende comando 'comando.clientes.cobrar' y responde al Orquestador"
     }
 
 
@@ -33,7 +59,8 @@ def crear_cliente(
     nuevo_cliente = Cliente(
         nombre=cliente.nombre,
         email=cliente.email,
-        telefono=cliente.telefono
+        telefono=cliente.telefono,
+        saldo=cliente.saldo or 0.0
     )
 
     db.add(nuevo_cliente)
@@ -65,10 +92,9 @@ def obtener_cliente(
 def obtener_clientes(
     db: Session = Depends(get_db)
 ):
-    clientes = db.query(Cliente).all()
+    return db.query(Cliente).all()
 
-    return clientes
-    
+
 @app.get("/clientes/{cliente_id}/zapato/{id_zapato}")
 def obtener_cliente_y_zapato(
     cliente_id: int,

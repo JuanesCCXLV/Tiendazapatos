@@ -22,8 +22,14 @@ services:
       - "8001:8001"
     environment:
       DATABASE_URL: postgresql+psycopg2://clientes_app:clientes123@clientes-db:5432/tienda_clientes
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin123
     depends_on:
       clientes-db:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   zapatos-db:
@@ -48,8 +54,14 @@ services:
       - "8002:8002"
     environment:
       DATABASE_URL: postgresql+psycopg2://zapatos_app:zapatos123@zapatos-db:5432/tienda_zapatos
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin123
     depends_on:
       zapatos-db:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   ventas-db:
@@ -74,11 +86,49 @@ services:
       - "8003:8003"
     environment:
       MONGO_URL: mongodb://ventas_app:ventas123@ventas-db:27017/tienda_ventas?authSource=admin
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin123
     depends_on:
       ventas-db:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  orquestador-service:
+    build: ./orquestador-service
+    container_name: orquestador-service
+    ports:
+      - "8004:8004"
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin123
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
 
 volumes:
   clientes_data:
   zapatos_data:
   ventas_data:
+  rabbitmq_data:
